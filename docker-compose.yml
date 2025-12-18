@@ -1,0 +1,128 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: pdf-summary-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+    develop:
+      watch:
+        - path: ./backend
+          target: /app
+          action: sync
+          ignore:
+            - __pycache__
+            - "*.pyc"
+        - path: ./backend/requirements.txt
+          action: rebuild
+    networks:
+      - app-network
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  text-extraction-handler:
+    build:
+      context: ./text-extraction-handler
+      dockerfile: Dockerfile
+    container_name: text-extraction-handler
+    env_file:
+      - .env
+    command: ["python", "main.py"]
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+    develop:
+      watch:
+        - path: ./text-extraction-handler
+          target: /app
+          action: sync
+          ignore:
+            - __pycache__
+            - "*.pyc"
+        - path: ./text-extraction-handler/requirements.txt
+          action: rebuild
+    depends_on:
+      - redis
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  summary-generation-handler:
+    build:
+      context: ./summary-generation-handler
+      dockerfile: Dockerfile
+    container_name: summary-generation-handler
+    env_file:
+      - .env
+    command: ["python", "main.py"]
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+    develop:
+      watch:
+        - path: ./summary-generation-handler
+          target: /app
+          action: sync
+          ignore:
+            - __pycache__
+            - "*.pyc"
+        - path: ./summary-generation-handler/requirements.txt
+          action: rebuild
+    depends_on:
+      - redis
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: pdf-summary-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: pdf-summary-frontend
+    ports:
+      - "3000:3000"
+    volumes:
+      - /app/node_modules
+      - /app/.next
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    develop:
+      watch:
+        - path: ./frontend
+          target: /app
+          action: sync
+          ignore:
+            - node_modules
+            - .next
+        - path: ./frontend/package-lock.json
+          action: rebuild
+    depends_on:
+      - backend
+    networks:
+      - app-network
+    restart: unless-stopped
+
+networks:
+  app-network:
+    driver: bridge
+
