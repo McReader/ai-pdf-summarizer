@@ -27,10 +27,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
-async def root():
-    return {"message": "PDF Summary API is running very well"}
-
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
