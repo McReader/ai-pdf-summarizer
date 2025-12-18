@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -17,6 +18,7 @@ logging.basicConfig(
 STREAM_TEXT_READY = "pdf:text_ready"
 STREAM_SUMMARY_READY = "pdf:summary_ready"
 META_KEY_TEMPLATE = "pdf:meta:{file_id}"
+CONSUMER_GROUP = "summary_handlers"
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -36,6 +38,34 @@ def _update_meta(meta_key: str, mapping: Dict[str, Any]) -> None:
     client = get_redis_client()
     mapping["updated_at"] = _now_iso()
     client.hset(meta_key, mapping=mapping)
+
+
+def _get_consumer_name() -> str:
+    """Generate a unique consumer name for this instance."""
+    pid = os.getpid()
+    return f"text-summarizer-handler-{pid}"
+
+
+def _ensure_consumer_group(client) -> None:
+    """
+    Verify the consumer group exists (fallback - should be created by backend on startup).
+    This is a lightweight check that only creates if missing.
+    """
+    try:
+        client.xgroup_create(
+            name=STREAM_TEXT_READY,
+            groupname=CONSUMER_GROUP,
+            id="0",
+            mkstream=True  # Create stream if it doesn't exist
+        )
+        logging.info("Created consumer group '%s' for stream '%s'", CONSUMER_GROUP, STREAM_TEXT_READY)
+    except Exception as exc:
+        # Group already exists - this is fine
+        error_msg = str(exc).lower()
+        if "busygroup" in error_msg or "already exists" in error_msg:
+            logging.info("Consumer group '%s' already exists", CONSUMER_GROUP)
+        else:
+            logging.warning("Unexpected error creating consumer group: %s", exc)
 
 
 def summarize_text(text: str, extraction_mode: str) -> str:
@@ -75,68 +105,116 @@ def summarize_text(text: str, extraction_mode: str) -> str:
     return response.text.strip()
 
 
+def _process_message(message_id: str, raw_fields: Dict[Any, Any], client, consumer_name: str) -> bool:
+    """
+    Process a single message from the stream.
+    Returns True if processing was successful and message should be acknowledged.
+    """
+    fields = _decode_stream_fields(raw_fields)
+    
+    file_id = fields.get("file_id")
+    meta_key = fields.get("meta_key") or META_KEY_TEMPLATE.format(file_id=file_id)
+    extraction_mode = fields.get("extraction_mode")
+
+    logging.info("Generating summary for the file: %s", file_id)
+    
+    if not file_id:
+        logging.warning("Received text_ready event without file_id")
+        return True
+
+    text_bytes = client.hget(meta_key, "text")
+    text = text_bytes.decode() if text_bytes else ""
+    
+    if not text.strip():
+        logging.error("No text available for summary for file_id=%s", file_id)
+        _update_meta(
+            meta_key,
+            {"status": "error", "error": "missing_text_for_summary"},
+        )
+        return True
+
+    try:
+        summary = summarize_text(text, extraction_mode)
+    except Exception as exc:  # pragma: no cover - defensive
+        logging.exception("Failed to summarize text for %s: %s", file_id, exc)
+        _update_meta(
+            meta_key,
+            {"status": "error", "error": "summary_failed"},
+        )
+        
+        return False
+
+    _update_meta(
+        meta_key,
+        {"status": "summary_ready", "summary": summary},
+    )
+
+    client.xadd(
+        STREAM_SUMMARY_READY,
+        {
+            "file_id": file_id,
+            "meta_key": meta_key,
+        },
+    )
+    
+    return True
+
+
+def _process_pending_messages(client, consumer_name: str) -> None:
+    """Process pending (unacknowledged) messages for this consumer."""
+
+    pending = client.xreadgroup(
+        groupname=CONSUMER_GROUP,
+        consumername=consumer_name,
+        streams={STREAM_TEXT_READY: "0"},
+        count=100,
+        block=1000
+    )
+    
+    for stream, messages in pending:
+        logging.info("Processing %d pending messages", len(messages))
+        for message_id, message in messages:
+            success = _process_message(message_id, message, client, consumer_name)
+            if success:
+                client.xack(STREAM_TEXT_READY, CONSUMER_GROUP, message_id)
+        
+        logging.info("Finished processing pending messages")
+
 def consume_text_ready_stream() -> None:
     client = get_redis_client()
-    last_id = "$"
+    consumer_name = _get_consumer_name()
+    
+    _ensure_consumer_group(client)
+    
+    logging.info("Starting consumer '%s' in group '%s'", consumer_name, CONSUMER_GROUP)
+    
+    _process_pending_messages(client, consumer_name)
+    
     while True:
         try:
-            entries = client.xread({STREAM_TEXT_READY: last_id}, block=5000, count=1)
+            entries = client.xreadgroup(
+                groupname=CONSUMER_GROUP,
+                consumername=consumer_name,
+                streams={STREAM_TEXT_READY: ">"},
+                count=1,
+                block=5000
+            )
+            
             if not entries:
                 continue
 
             for _, messages in entries:
-                
                 for message_id, raw_fields in messages:
-                    last_id = message_id
-                    fields = _decode_stream_fields(raw_fields)
-                    file_id = fields.get("file_id")
-                    meta_key = fields.get("meta_key") or META_KEY_TEMPLATE.format(file_id=file_id)
-                    extraction_mode = fields.get("extraction_mode")
-
-                    logging.info("Genearting summary for the file: %s", file_id)
+                    success = _process_message(message_id, raw_fields, client, consumer_name)
+                    if success:
+                        logging.info("Acknowledged message: %s", message_id)
+                        client.xack(STREAM_TEXT_READY, CONSUMER_GROUP, message_id)
                     
-                    if not file_id:
-                        logging.warning("Received text_ready event without file_id")
-                        continue
-
-                    text_bytes = client.hget(meta_key, "text")
-                    text = text_bytes.decode() if text_bytes else ""
-                    if not text.strip():
-                        logging.error("No text available for summary for file_id=%s", file_id)
-                        _update_meta(
-                            meta_key,
-                            {"status": "error", "error": "missing_text_for_summary"},
-                        )
-                        continue
-
-                    try:
-                        summary = summarize_text(text, extraction_mode)
-                    except Exception as exc:  # pragma: no cover - defensive
-                        logging.exception("Failed to summarize text for %s: %s", file_id, exc)
-                        _update_meta(
-                            meta_key,
-                            {"status": "error", "error": "summary_failed"},
-                        )
-                        continue
-
-                    _update_meta(
-                        meta_key,
-                        {"status": "summary_ready", "summary": summary},
-                    )
-
-                    client.xadd(
-                        STREAM_SUMMARY_READY,
-                        {
-                            "file_id": file_id,
-                            "meta_key": meta_key,
-                        },
-                    )
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception as exc:
             logging.exception("Error consuming text_ready stream: %s", exc)
             time.sleep(1)
 
 
 if __name__ == "__main__":
-    logging.info("Starting summary worker for text_ready stream")
     consume_text_ready_stream()
 
