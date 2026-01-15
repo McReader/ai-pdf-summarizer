@@ -50,7 +50,6 @@ def _ensure_consumer_group(client) -> None:
         )
         logging.info("Created consumer group '%s' for stream '%s'", CONSUMER_GROUP, STREAM_TEXT_READY)
     except Exception as exc:
-        # Group already exists - this is fine
         error_msg = str(exc).lower()
         if "busygroup" in error_msg or "already exists" in error_msg:
             logging.info("Consumer group '%s' already exists", CONSUMER_GROUP)
@@ -111,8 +110,7 @@ def _process_message(fields: Dict[Any, Any], client) -> bool:
         logging.warning("Received text_ready event without file_id")
         return True
 
-    text_bytes = client.hget(meta_key, "text")
-    text = text_bytes.decode() if text_bytes else ""
+    text = client.hget(meta_key, "text") or ""
     
     if not text.strip():
         logging.error("No text available for summary for file_id=%s", file_id)
